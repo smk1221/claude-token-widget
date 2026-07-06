@@ -276,6 +276,8 @@ final class LimitsStore: ObservableObject {
     private var timer: Timer?
     private let fetchLock = NSLock()
     private var isFetching = false
+    private var nextAllowedFetch = Date.distantPast // 限流退避 + 基础节流
+    private var rateLimitStreak = 0
 
     func start() {
         fetch()
@@ -284,7 +286,9 @@ final class LimitsStore: ObservableObject {
         }
     }
 
-    func fetch() {
+    /// force = 用户主动操作(菜单刷新/登录成功),忽略节流窗口
+    func fetch(force: Bool = false) {
+        guard force || Date() >= nextAllowedFetch else { return }
         fetchLock.lock()
         let busy = isFetching
         if !busy { isFetching = true }
@@ -338,6 +342,20 @@ final class LimitsStore: ObservableObject {
                 DispatchQueue.main.async {
                     self.needsAuth = true
                     self.errorText = nil
+                }
+                self.done()
+                return
+            }
+            if code == 429 {
+                // 被限流:优先听服务器的 Retry-After,否则指数退避 5→10→20→30 分钟
+                let ra = (resp as? HTTPURLResponse)?
+                    .value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+                DispatchQueue.main.async {
+                    let delay = ra ?? min(300 * pow(2.0, Double(self.rateLimitStreak)), 1800)
+                    self.rateLimitStreak += 1
+                    self.nextAllowedFetch = Date().addingTimeInterval(delay)
+                    DebugLog.log("HTTP 429 限流,\(Int(delay)) 秒后重试")
+                    self.errorText = "接口限流,约 \(max(1, Int(delay / 60))) 分钟后自动重试"
                 }
                 self.done()
                 return
@@ -414,6 +432,8 @@ final class LimitsStore: ObservableObject {
             self.errorText = nil
             self.needsAuth = false
             self.lastOK = Date()
+            self.rateLimitStreak = 0
+            self.nextAllowedFetch = Date().addingTimeInterval(110) // 成功后基础节流 ~2 分钟
         }
     }
 
@@ -1625,7 +1645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu() // 提供「编辑」菜单,否则无边框应用里 ⌘V 粘贴不可用
         store.start()
         limits.start()
-        auth.onLoggedIn = { [weak self] in self?.limits.fetch() }
+        auth.onLoggedIn = { [weak self] in self?.limits.fetch(force: true) }
 
         var applyHeight: (CGFloat) -> Void = { _ in }
         let rootView = WidgetView(store: store, limits: limits, auth: auth,
@@ -1726,7 +1746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleFromStatusItem()
     }
 
-    @objc private func refreshNow() { limits.fetch() }
+    @objc private func refreshNow() { limits.fetch(force: true) }
 
     @objc private func togglePanelFromMenu() { toggleFromStatusItem() }
 
