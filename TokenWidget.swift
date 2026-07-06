@@ -332,16 +332,25 @@ final class LimitsStore: ObservableObject {
                 let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 DebugLog.log("HTTP \(code): \(body.prefix(300))")
                 self.token = nil
-                // 先尝试刷新小组件自己的 OAuth 令牌,再重读其他来源
-                if allowAuthRetry, let fresh = TokenFile.refreshSync() ?? Self.readToken(), fresh != tok {
-                    self.token = fresh
-                    self.performFetch(allowAuthRetry: false)
-                    return
+                // 先尝试刷新小组件自己的 OAuth 令牌
+                if allowAuthRetry {
+                    let r = TokenFile.refreshSync()
+                    if r.grantDead {
+                        // 授权已被吊销:清掉死令牌,让后备凭证(CLI 登录等)有机会顶上
+                        TokenFile.delete()
+                        DebugLog.log("授权已吊销,已清除失效令牌")
+                    }
+                    if let fresh = r.token ?? Self.readToken(), fresh != tok {
+                        self.token = fresh
+                        self.performFetch(allowAuthRetry: false)
+                        return
+                    }
                 }
-                // 令牌无效或权限不足 → 显示登录入口
+                // 令牌无效或权限不足 → 显示登录入口,并停止空转重试
                 DispatchQueue.main.async {
                     self.needsAuth = true
                     self.errorText = nil
+                    self.nextAllowedFetch = Date().addingTimeInterval(300)
                 }
                 self.done()
                 return
@@ -636,17 +645,22 @@ enum TokenFile {
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
+    static func delete() {
+        try? FileManager.default.removeItem(at: url)
+    }
+
     /// 取当前可用的 accessToken,快过期则先刷新(在后台线程调用)
     static func currentAccess() -> String? {
         guard let t = load() else { return nil }
         if let exp = t.expiresAt, exp - 300 < Date().timeIntervalSince1970, t.refreshToken != nil {
-            return refreshSync() ?? t.accessToken
+            return refreshSync().token ?? t.accessToken
         }
         return t.accessToken
     }
 
-    static func refreshSync() -> String? {
-        guard var t = load(), let rt = t.refreshToken else { return nil }
+    /// grantDead = 刷新被 4xx 拒绝,说明授权已被吊销,令牌救不回来了
+    static func refreshSync() -> (token: String?, grantDead: Bool) {
+        guard var t = load(), let rt = t.refreshToken else { return (nil, false) }
         var req = URLRequest(url: OAuth.tokenURL)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -658,6 +672,7 @@ enum TokenFile {
         req.timeoutInterval = 15
         let sem = DispatchSemaphore(value: 0)
         var result: String?
+        var grantDead = false
         URLSession.shared.dataTask(with: req) { data, resp, _ in
             defer { sem.signal() }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
@@ -665,6 +680,7 @@ enum TokenFile {
                   let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let at = o["access_token"] as? String else {
                 DebugLog.log("刷新令牌失败 HTTP \(code)")
+                if (400...499).contains(code) { grantDead = true }
                 return
             }
             t.accessToken = at
@@ -677,7 +693,7 @@ enum TokenFile {
             result = at
         }.resume()
         sem.wait()
-        return result
+        return (result, grantDead)
     }
 }
 
