@@ -323,7 +323,7 @@ final class LimitsStore: ObservableObject {
             guard let self else { return }
             if let err {
                 DebugLog.log("请求失败: \(err.localizedDescription)")
-                self.publish(error: "网络连接失败")
+                self.transientFailure("网络中断,自动重试中", baseDelay: 90)
                 self.done()
                 return
             }
@@ -357,6 +357,13 @@ final class LimitsStore: ObservableObject {
                     DebugLog.log("HTTP 429 限流,\(Int(delay)) 秒后重试")
                     self.errorText = "接口限流,约 \(max(1, Int(delay / 60))) 分钟后自动重试"
                 }
+                self.done()
+                return
+            }
+            if (500...599).contains(code) {
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                DebugLog.log("HTTP \(code)(服务端故障): \(body.prefix(200))")
+                self.transientFailure("Claude 服务暂不可用,自动重试中", baseDelay: 90)
                 self.done()
                 return
             }
@@ -439,6 +446,23 @@ final class LimitsStore: ObservableObject {
 
     private func publish(error: String) {
         DispatchQueue.main.async { self.errorText = error } // 保留上次数据
+    }
+
+    /// 瞬时故障(网络/5xx):保留数据,按失败次数指数退避后自动重试
+    private func transientFailure(_ message: String, baseDelay: TimeInterval) {
+        DispatchQueue.main.async {
+            let delay = min(baseDelay * pow(2.0, Double(self.rateLimitStreak)), 900)
+            self.rateLimitStreak += 1
+            self.nextAllowedFetch = Date().addingTimeInterval(delay)
+            self.errorText = message
+            DebugLog.log("瞬时故障,退避 \(Int(delay))s 后重试")
+        }
+    }
+
+    /// 数据是否已经不新鲜(10 分钟内有成功数据就不必打扰用户)
+    var isStale: Bool {
+        guard let ok = lastOK else { return true }
+        return Date().timeIntervalSince(ok) > 600
     }
 
     private static func rank(_ k: String) -> Int {
@@ -1436,7 +1460,8 @@ struct WidgetView: View {
             }
             if limits.needsAuth {
                 loginSection
-            } else if let e = limits.errorText {
+            } else if let e = limits.errorText, limits.isStale {
+                // 数据仍新鲜时不显示瞬时错误,静默重试即可
                 Text("⚠️ \(e)")
                     .font(.system(size: 9.5, design: .rounded))
                     .foregroundStyle(barYellow.opacity(0.95))
