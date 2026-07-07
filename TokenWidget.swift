@@ -286,12 +286,21 @@ final class LimitsStore: ObservableObject {
         }
     }
 
+    private var fetchStartedAt = Date.distantPast
+
     /// force = 用户主动操作(菜单刷新/登录成功),忽略节流窗口
     func fetch(force: Bool = false) {
         guard force || Date() >= nextAllowedFetch else { return }
         fetchLock.lock()
-        let busy = isFetching
-        if !busy { isFetching = true }
+        var busy = isFetching
+        if busy && Date().timeIntervalSince(fetchStartedAt) > 90 {
+            busy = false // 看门狗:上一次请求 90 秒未归还,判定卡死,强制解锁
+            DebugLog.log("看门狗:上次请求卡死,强制解锁重试")
+        }
+        if !busy {
+            isFetching = true
+            fetchStartedAt = Date()
+        }
         fetchLock.unlock()
         guard !busy else { return } // 上一次还没结束(例如钥匙串授权框还没点)
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -332,27 +341,26 @@ final class LimitsStore: ObservableObject {
                 let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 DebugLog.log("HTTP \(code): \(body.prefix(300))")
                 self.token = nil
-                // 先尝试刷新小组件自己的 OAuth 令牌
-                if allowAuthRetry {
+                guard allowAuthRetry else {
+                    self.authFailed()
+                    self.done()
+                    return
+                }
+                // 关键:阻塞式刷新绝不能在 URLSession 回调线程上做(会卡死回调队列)
+                DispatchQueue.global(qos: .utility).async {
                     let r = TokenFile.refreshSync()
                     if r.grantDead {
-                        // 授权已被吊销:清掉死令牌,让后备凭证(CLI 登录等)有机会顶上
                         TokenFile.delete()
                         DebugLog.log("授权已吊销,已清除失效令牌")
                     }
                     if let fresh = r.token ?? Self.readToken(), fresh != tok {
                         self.token = fresh
                         self.performFetch(allowAuthRetry: false)
-                        return
+                    } else {
+                        self.authFailed()
+                        self.done()
                     }
                 }
-                // 令牌无效或权限不足 → 显示登录入口,并停止空转重试
-                DispatchQueue.main.async {
-                    self.needsAuth = true
-                    self.errorText = nil
-                    self.nextAllowedFetch = Date().addingTimeInterval(300)
-                }
-                self.done()
                 return
             }
             if code == 429 {
@@ -455,6 +463,15 @@ final class LimitsStore: ObservableObject {
 
     private func publish(error: String) {
         DispatchQueue.main.async { self.errorText = error } // 保留上次数据
+    }
+
+    /// 令牌无效或权限不足 → 显示登录入口,并停止空转重试
+    private func authFailed() {
+        DispatchQueue.main.async {
+            self.needsAuth = true
+            self.errorText = nil
+            self.nextAllowedFetch = Date().addingTimeInterval(300)
+        }
     }
 
     /// 瞬时故障(网络/5xx):保留数据,按失败次数指数退避后自动重试
@@ -653,7 +670,14 @@ enum TokenFile {
     static func currentAccess() -> String? {
         guard let t = load() else { return nil }
         if let exp = t.expiresAt, exp - 300 < Date().timeIntervalSince1970, t.refreshToken != nil {
-            return refreshSync().token ?? t.accessToken
+            let r = refreshSync()
+            if r.grantDead {
+                // 授权被吊销:死令牌直接清掉,别再拿去撞 401
+                delete()
+                DebugLog.log("授权已吊销,已清除失效令牌")
+                return nil
+            }
+            return r.token ?? t.accessToken
         }
         return t.accessToken
     }
