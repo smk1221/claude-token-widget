@@ -1222,7 +1222,6 @@ struct WidgetView: View {
     @StateObject private var crab = CrabController()
     @State private var hovering = false
     @State private var crabHover = false
-    @State private var histMode = false
     @State private var authCode = ""
 
     private let corner: CGFloat = 24
@@ -1236,8 +1235,7 @@ struct WidgetView: View {
             crabZone(stats: stats, now: now)
             VStack(alignment: .leading, spacing: 11) {
                 header(isLive: isLive)
-                bigNumber(stats)
-                sparklineCard(stats)
+                resetCountdown(now: now)
                 limitsCard(now: now)
             }
             .padding(15)
@@ -1372,119 +1370,26 @@ struct WidgetView: View {
         }
     }
 
-    private func bigNumber(_ stats: Stats) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text("今日费用")
+    // 当前会话重置倒计时(时·分,不带秒)
+    private func resetCountdown(now: Date) -> some View {
+        let reset = limits.rows.first(where: { $0.isSession })?.resetsAt
+        return VStack(alignment: .leading, spacing: 2) {
+            Text("重置时间")
                 .font(.system(size: 9.5, weight: .medium, design: .rounded))
                 .foregroundStyle(.white.opacity(0.5))
-            Text(fmtMoney(stats.todayCost))
-                .font(.system(size: 30, weight: .bold, design: .rounded).monospacedDigit())
-                .foregroundStyle(accentGrad)
-                .shadow(color: accentOrange.opacity(0.3), radius: 10)
-            Text("\(fmtTokens(stats.todayTokens)) tokens · \(stats.todayRequests) 次请求")
-                .font(.system(size: 10, design: .rounded))
-                .foregroundStyle(.white.opacity(0.5))
+            if let r = reset, r > now {
+                Text(fmtRemain(r.timeIntervalSince(now)))
+                    .font(.system(size: 32, weight: .bold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(accentGrad)
+                    .shadow(color: accentOrange.opacity(0.3), radius: 10)
+            } else {
+                Text("无活跃会话")
+                    .font(.system(size: 24, weight: .bold, design: .rounded))
+                    .foregroundStyle(accentGrad)
+                    .shadow(color: accentOrange.opacity(0.25), radius: 8)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func sparklineCard(_ stats: Stats) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(histMode
-                     ? "近 7 天 · 共 \(fmtMoney(stats.daily.reduce(0) { $0 + $1.cost }))"
-                     : "近 60 分钟")
-                    .font(.system(size: 8.5, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.45))
-                Spacer()
-                modeChip("60分", selected: !histMode) { histMode = false }
-                modeChip("7天", selected: histMode) { histMode = true }
-            }
-            if histMode {
-                dailyChart(stats)
-            } else {
-                minuteChart(stats)
-            }
-        }
-        .padding(9)
-        .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func modeChip(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(.system(size: 8, weight: .semibold, design: .rounded))
-                .foregroundStyle(selected ? .white : .white.opacity(0.4))
-                .padding(.horizontal, 6).padding(.vertical, 2.5)
-                .background(selected ? .white.opacity(0.14) : .clear, in: Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func minuteChart(_ stats: Stats) -> some View {
-        Canvas { ctx, size in
-            let buckets = stats.sparkline
-            let maxV = max(buckets.max() ?? 1, 1)
-            let n = buckets.count
-            let gap: CGFloat = 1.5
-            let bw = (size.width - gap * CGFloat(n - 1)) / CGFloat(n)
-            for (i, v) in buckets.enumerated() {
-                let ratio: CGFloat = v <= 0 ? 0.06 : max(0.12, CGFloat(sqrt(v / maxV)))
-                let h = size.height * ratio
-                let rect = CGRect(x: CGFloat(i) * (bw + gap), y: size.height - h, width: bw, height: h)
-                let path = Path(roundedRect: rect, cornerRadius: bw / 2)
-                if v <= 0 {
-                    ctx.fill(path, with: .color(.white.opacity(0.10)))
-                } else {
-                    ctx.fill(path, with: .linearGradient(
-                        Gradient(colors: [accentPink, accentOrange]),
-                        startPoint: CGPoint(x: 0, y: size.height),
-                        endPoint: CGPoint(x: 0, y: 0)))
-                }
-            }
-        }
-        .frame(height: 26)
-    }
-
-    private func dailyChart(_ stats: Stats) -> some View {
-        Canvas { ctx, size in
-            let days = stats.daily
-            guard !days.isEmpty else { return }
-            let maxV = max(days.map(\.cost).max() ?? 0.01, 0.01)
-            let n = days.count
-            let gap: CGFloat = 5
-            let bw = (size.width - gap * CGFloat(n - 1)) / CGFloat(n)
-            let chartH = size.height - 11
-            for (i, d) in days.enumerated() {
-                let ratio: CGFloat = d.cost <= 0 ? 0.05 : max(0.09, CGFloat(d.cost / maxV))
-                let h = chartH * ratio
-                let x = CGFloat(i) * (bw + gap)
-                let isToday = i == n - 1
-                let path = Path(roundedRect: CGRect(x: x, y: chartH - h, width: bw, height: h),
-                                cornerRadius: 3)
-                if d.cost <= 0 {
-                    ctx.fill(path, with: .color(.white.opacity(0.08)))
-                } else {
-                    var c = ctx
-                    c.opacity = isToday ? 1 : 0.5
-                    c.fill(path, with: .linearGradient(
-                        Gradient(colors: [accentPink, accentOrange]),
-                        startPoint: CGPoint(x: 0, y: chartH),
-                        endPoint: CGPoint(x: 0, y: 0)))
-                }
-                if isToday && d.cost > 0 {
-                    ctx.draw(Text(fmtMoney(d.cost))
-                                .font(.system(size: 6.5, weight: .semibold, design: .rounded))
-                                .foregroundStyle(.white.opacity(0.85)),
-                             at: CGPoint(x: x + bw / 2, y: max(chartH - h - 6, 5)))
-                }
-                ctx.draw(Text(weekdayShort.string(from: d.day))
-                            .font(.system(size: 6.5))
-                            .foregroundStyle(.white.opacity(isToday ? 0.8 : 0.4)),
-                         at: CGPoint(x: x + bw / 2, y: size.height - 3.5))
-            }
-        }
-        .frame(height: 48)
     }
 
     private func limitsCard(now: Date) -> some View {
